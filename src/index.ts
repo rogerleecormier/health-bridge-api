@@ -5,119 +5,153 @@ import { cors } from "hono/cors";
 type Env = {
   Bindings: {
     DB: D1Database;
-    APP_TOKEN: string;
-    ALLOWED_ORIGINS?: string;
+    APP_TOKEN?: string;         // optional; if set, required by POST
+    ALLOWED_ORIGINS?: string;   // comma-separated list, e.g., "https://rcormier.dev,https://www.rcormier.dev"
   };
 };
 
+// ---------- Schemas ----------
+const WeightIn = z.object({
+  weight: z.number().openapi({ example: 372.4 }),
+  unit: z.enum(["lb", "kg"]).openapi({ example: "lb" }),
+  // ISO-8601 with offset (Shortcuts format). You can switch to UTC server-side if preferred.
+  timestamp: z.string().openapi({ example: "2025-08-17T12:47:05-04:00" }),
+}).openapi("WeightIn");
+
+const WeightRow = z.object({
+  date: z.string().openapi({ example: "2025-08-17T12:47:05-04:00" }),
+  kg: z.number().openapi({ example: 169.00 }),
+  lb: z.number().openapi({ example: 372.4 }),
+});
+
+// ---------- App ----------
 const app = new OpenAPIHono<Env>();
 
-// CORS
+// CORS (allow your sites; fallback to *)
 app.use(
   "*",
-  (c, next) =>
-    cors({
-      origin: (origin) => {
-        const allow = (c.env.ALLOWED_ORIGINS || "").split(",").map((s) => s.trim());
-        if (!origin) return allow[0] || "*";
-        return allow.includes(origin) ? origin : allow[0] || "*";
-      },
-      allowHeaders: ["authorization", "content-type"],
-      allowMethods: ["GET", "POST", "OPTIONS"],
-    })(c, next)
+  cors({
+    origin: (origin, c) => {
+      const list = (c.env.ALLOWED_ORIGINS ?? "").split(",").map(s => s.trim()).filter(Boolean);
+      if (list.length === 0) return "*";
+      return list.includes(origin ?? "") ? origin : list[0]; // be permissive to first allowed
+    },
+    allowMethods: ["GET", "POST", "OPTIONS"],
+    allowHeaders: ["Content-Type", "Authorization"],
+  })
 );
 
-// Schemas
-const BodyMassPoint = z.object({
-  uuid: z.string().uuid(),
-  startDate: z.string().datetime(),
-  endDate: z.string().datetime(),
-  unit: z.enum(["kg", "lb"]),
-  value: z.number().positive(),
-  sourceBundleId: z.string(),
-});
-const ImportPayload = z.object({ bodyMass: z.array(BodyMassPoint).default([]) });
-const WeightRow = z.object({
-  date: z.string().datetime(),
-  kg: z.number(),
-  lb: z.number(), // Add lb to schema
-});
-
-// Auth
-function checkBearer(c: any) {
-  const h = c.req.header("authorization") || "";
-  const tok = h.startsWith("Bearer ") ? h.slice(7) : "";
-  return tok && tok === c.env.APP_TOKEN;
-}
-
-// Sub-app mounted under /api
+// Sub-app under /api
 const api = new OpenAPIHono<Env>();
 
+// ---------- Auth helper ----------
+function requireBearer(c: any) {
+  const expected = c.env.APP_TOKEN;
+  if (!expected) return true; // no token configured, skip auth
+  const auth = c.req.header("authorization") ?? "";
+  const ok = auth.startsWith("Bearer ") && auth.slice(7) === expected;
+  if (!ok) {
+    return c.json({ ok: false, error: "Unauthorized" }, 401);
+  }
+  return null;
+}
+
+// ---------- POST /api/health/weight ----------
 api.openapi(
   createRoute({
     method: "post",
-    path: "/health/import",
+    path: "/health/weight",
     request: {
-      body: { content: { "application/json": { schema: ImportPayload } } },
-      headers: z.object({ authorization: z.string() }),
+      body: {
+        content: {
+          "application/json": { schema: WeightIn },
+        },
+        required: true,
+      },
     },
     responses: {
-      200: { description: "OK", content: { "application/json": { schema: z.object({ ok: z.boolean(), upserts: z.number() }) } } },
-      400: { description: "Invalid payload" },
+      200: {
+        description: "Stored",
+        content: { "application/json": { schema: z.object({ ok: z.literal(true) }) } },
+      },
       401: { description: "Unauthorized" },
+      400: { description: "Bad Request" },
     },
-    tags: ["Health"],
-    summary: "Import body weight samples",
+    tags: ["weight"],
   }),
   async (c) => {
-    if (!checkBearer(c)) return c.json({ error: "Unauthorized" }, 401);
-    const payload = ImportPayload.parse(await c.req.json());
-    if (!payload.bodyMass.length) return c.json({ ok: true, upserts: 0 });
+    const authFail = requireBearer(c);
+    if (authFail) return authFail;
 
-    const stmt = `
-      INSERT INTO weight (uuid, startDate, endDate, kg, sourceBundleId, createdAt, updatedAt)
-      VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'), datetime('now'))
-      ON CONFLICT(uuid) DO UPDATE SET
-        startDate=excluded.startDate,
-        endDate=excluded.endDate,
-        kg=excluded.kg,
-        sourceBundleId=excluded.sourceBundleId,
-        updatedAt=datetime('now');
-    `;
-    const batch = payload.bodyMass.map((s) => {
-      const kg = s.unit === "lb" ? s.value / 2.20462 : s.value;
-      return c.env.DB.prepare(stmt).bind(s.uuid, s.startDate, s.endDate, kg, s.sourceBundleId);
-    });
-    await c.env.DB.batch(batch);
-    return c.json({ ok: true, upserts: payload.bodyMass.length });
+    const body = await c.req.json<z.infer<typeof WeightIn>>().catch(() => null);
+    if (!body) return c.json({ ok: false, error: "Invalid JSON" }, 400);
+
+    // Normalize to kg
+    const kg = body.unit === "lb" ? body.weight / 2.20462 : body.weight;
+    const kgFixed = Number(kg.toFixed(2));
+
+    // Write to D1
+    // Ensure you created a table like:
+    // CREATE TABLE IF NOT EXISTS weight (date TEXT PRIMARY KEY, kg REAL);
+    // If you don't have a UNIQUE/PK on date, drop the ON CONFLICT clause.
+    const stmt = c.env.DB.prepare(
+      `INSERT INTO weight (uuid, startDate, endDate, kg, sourceBundleId, createdAt, updatedAt)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+       ON CONFLICT(uuid) DO UPDATE SET kg=excluded.kg, updatedAt=excluded.updatedAt`
+    ).bind(
+      body.uuid,
+      body.startDate,
+      body.endDate,
+      kgFixed,
+      body.sourceBundleId,
+      new Date().toISOString(),
+      new Date().toISOString()
+    );
+
+    await stmt.run();
+
+    return c.json({ ok: true });
   }
 );
 
+// ---------- GET /api/health/weight?limit=30 ----------
 api.openapi(
   createRoute({
     method: "get",
     path: "/health/weight",
-    responses: {
-      200: { description: "List", content: { "application/json": { schema: z.array(WeightRow) } } },
+    request: {
+      query: z.object({
+        limit: z.string().optional().openapi({ example: "30" }),
+      }),
     },
-    tags: ["Health"],
-    summary: "List weight samples",
+    responses: {
+      200: {
+        description: "Recent rows",
+        content: { "application/json": { schema: z.array(WeightRow) } },
+      },
+    },
+    tags: ["weight"],
   }),
   async (c) => {
-    const rs = await c.env.DB.prepare(
-      "SELECT startDate as date, kg FROM weight ORDER BY startDate ASC;"
-    ).all();
-    // Map results to include lb conversion
-    const results = (rs.results || []).map((row: any) => ({
+    const url = new URL(c.req.url);
+    const limit = Math.max(1, Math.min(200, Number(url.searchParams.get("limit") ?? "30")));
+
+    // For GET queries, select startDate as date:
+    const rows = await c.env.DB.prepare(
+      `SELECT startDate AS date, kg FROM weight ORDER BY startDate DESC LIMIT ?1`
+    ).bind(limit).all();
+
+    const results = (rows.results ?? []).map((row: any) => ({
       date: row.date,
       kg: row.kg,
-      lb: Number((row.kg * 2.20462).toFixed(2)), // Convert kg to lb
+      lb: Number((row.kg * 2.20462).toFixed(2)),
     }));
+
     return c.json(results as z.infer<typeof WeightRow>[]);
   }
 );
 
-// mount at /api and keep docs
+// Mount API and docs
 app.route("/api", api);
 app.doc("/openapi.json", { openapi: "3.1.0", info: { title: "Health Bridge API", version: "1.0.0" } });
 

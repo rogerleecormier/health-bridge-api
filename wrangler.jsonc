@@ -6,7 +6,7 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "health-bridge-api",
   "main": "src/index.ts",
-  "compatibility_date": "2025-08-16",
+  "compatibility_date": "2025-08-17",
 
   "observability": { "enabled": true },
 
