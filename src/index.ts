@@ -37,7 +37,11 @@ const BodyMassPoint = z.object({
   sourceBundleId: z.string(),
 });
 const ImportPayload = z.object({ bodyMass: z.array(BodyMassPoint).default([]) });
-const WeightRow = z.object({ date: z.string().datetime(), kg: z.number() });
+const WeightRow = z.object({
+  date: z.string().datetime(),
+  kg: z.number(),
+  lb: z.number(), // Add lb to schema
+});
 
 // Auth
 function checkBearer(c: any) {
@@ -103,7 +107,13 @@ api.openapi(
     const rs = await c.env.DB.prepare(
       "SELECT startDate as date, kg FROM weight ORDER BY startDate ASC;"
     ).all();
-    return c.json((rs.results || []) as z.infer<typeof WeightRow>[]);
+    // Map results to include lb conversion
+    const results = (rs.results || []).map((row: any) => ({
+      date: row.date,
+      kg: row.kg,
+      lb: Number((row.kg * 2.20462).toFixed(2)), // Convert kg to lb
+    }));
+    return c.json(results as z.infer<typeof WeightRow>[]);
   }
 );
 
