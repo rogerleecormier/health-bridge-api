@@ -1,9 +1,0 @@
-# Bind your D1 database
-[[d1_databases]]
-binding = "DB"
-database_name = "health_bridge"
-database_id = "dd2b4664-fa2b-4534-8f07-3d1d0361ec06"
-
-[vars]
-# comma-separated list of sites allowed to fetch from the browser
-ALLOWED_ORIGINS = "https://rcormier.dev,https://www.rcormier.dev,http://localhost:5173"

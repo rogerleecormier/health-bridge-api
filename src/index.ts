@@ -14,8 +14,11 @@ type Env = {
 const WeightIn = z.object({
   weight: z.number().openapi({ example: 372.4 }),
   unit: z.enum(["lb", "kg"]).openapi({ example: "lb" }),
-  // ISO-8601 with offset (Shortcuts format). You can switch to UTC server-side if preferred.
   timestamp: z.string().openapi({ example: "2025-08-17T12:47:05-04:00" }),
+  uuid: z.string().optional().openapi({ example: "abc123-def456" }),
+  startDate: z.string().optional().openapi({ example: "2025-08-17T12:47:05-04:00" }),
+  endDate: z.string().optional().openapi({ example: "2025-08-17T12:47:05-04:00" }),
+  sourceBundleId: z.string().optional().openapi({ example: "com.apple.health" }),
 }).openapi("WeightIn");
 
 const WeightRow = z.object({
@@ -56,6 +59,15 @@ function requireBearer(c: any) {
   return null;
 }
 
+// Helper function to generate UUID (since crypto.randomUUID might not be available)
+function generateUUID(): string {
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+    const r = Math.random() * 16 | 0;
+    const v = c == 'x' ? r : (r & 0x3 | 0x8);
+    return v.toString(16);
+  });
+}
+
 // ---------- POST /api/health/weight ----------
 api.openapi(
   createRoute({
@@ -80,37 +92,79 @@ api.openapi(
     tags: ["weight"],
   }),
   async (c) => {
-    const authFail = requireBearer(c);
-    if (authFail) return authFail;
+    try {
+      const authFail = requireBearer(c);
+      if (authFail) return authFail;
 
-    const body = await c.req.json<z.infer<typeof WeightIn>>().catch(() => null);
-    if (!body) return c.json({ ok: false, error: "Invalid JSON" }, 400);
+      // Parse and validate the request body
+      let body;
+      try {
+        const rawBody = await c.req.json();
+        console.log("Raw body received:", JSON.stringify(rawBody, null, 2));
+        
+        // Validate with Zod
+        body = WeightIn.parse(rawBody);
+        console.log("Validated body:", JSON.stringify(body, null, 2));
+      } catch (parseError) {
+        console.error("JSON parse or validation error:", parseError);
+        return c.json({ ok: false, error: "Invalid JSON or missing required fields" }, 400);
+      }
 
-    // Normalize to kg
-    const kg = body.unit === "lb" ? body.weight / 2.20462 : body.weight;
-    const kgFixed = Number(kg.toFixed(2));
+      // Normalize to kg
+      const kg = body.unit === "lb" ? body.weight / 2.20462 : body.weight;
+      const kgFixed = Number(kg.toFixed(2));
 
-    // Write to D1
-    // Ensure you created a table like:
-    // CREATE TABLE IF NOT EXISTS weight (date TEXT PRIMARY KEY, kg REAL);
-    // If you don't have a UNIQUE/PK on date, drop the ON CONFLICT clause.
-    const stmt = c.env.DB.prepare(
-      `INSERT INTO weight (uuid, startDate, endDate, kg, sourceBundleId, createdAt, updatedAt)
-       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-       ON CONFLICT(uuid) DO UPDATE SET kg=excluded.kg, updatedAt=excluded.updatedAt`
-    ).bind(
-      body.uuid,
-      body.startDate,
-      body.endDate,
-      kgFixed,
-      body.sourceBundleId,
-      new Date().toISOString(),
-      new Date().toISOString()
-    );
+      // Generate UUID if not provided - ensure it's never undefined or empty
+      let uuid = body.uuid?.trim();
+      if (!uuid) {
+        try {
+          uuid = crypto.randomUUID();
+        } catch {
+          uuid = generateUUID();
+        }
+      }
+      
+      // Use timestamp for startDate/endDate if not provided - ensure they're never undefined
+      const startDate = body.startDate?.trim() || body.timestamp;
+      const endDate = body.endDate?.trim() || body.timestamp;
+      const sourceBundleId = body.sourceBundleId?.trim() || "manual-entry";
 
-    await stmt.run();
+      // Final validation - ensure no undefined or empty values
+      const values = { uuid, startDate, endDate, kgFixed, sourceBundleId };
+      console.log("Final values to bind:", values);
 
-    return c.json({ ok: true });
+      // Check for any undefined, null, or empty string values
+      for (const [key, value] of Object.entries(values)) {
+        if (value === undefined || value === null || value === "") {
+          console.error(`Invalid value for ${key}:`, value);
+          return c.json({ ok: false, error: `Invalid value for ${key}` }, 400);
+        }
+      }
+
+      const currentTime = new Date().toISOString();
+
+      const stmt = c.env.DB.prepare(
+        `INSERT INTO weight (uuid, startDate, endDate, kg, sourceBundleId, createdAt, updatedAt)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(uuid) DO UPDATE SET kg=excluded.kg, updatedAt=excluded.updatedAt`
+      ).bind(
+        uuid,
+        startDate,
+        endDate,
+        kgFixed,
+        sourceBundleId,
+        currentTime,
+        currentTime
+      );
+
+      await stmt.run();
+      console.log("Successfully inserted/updated weight record");
+      return c.json({ ok: true });
+      
+    } catch (error) {
+      console.error("Unexpected error:", error);
+      return c.json({ ok: false, error: "Internal server error" }, 500);
+    }
   }
 );
 
@@ -133,21 +187,26 @@ api.openapi(
     tags: ["weight"],
   }),
   async (c) => {
-    const url = new URL(c.req.url);
-    const limit = Math.max(1, Math.min(200, Number(url.searchParams.get("limit") ?? "30")));
+    try {
+      const url = new URL(c.req.url);
+      const limit = Math.max(1, Math.min(200, Number(url.searchParams.get("limit") ?? "30")));
 
-    // For GET queries, select startDate as date:
-    const rows = await c.env.DB.prepare(
-      `SELECT startDate AS date, kg FROM weight ORDER BY startDate DESC LIMIT ?1`
-    ).bind(limit).all();
+      const rows = await c.env.DB.prepare(
+        `SELECT startDate AS date, kg FROM weight ORDER BY startDate DESC LIMIT ?1`
+      ).bind(limit).all();
 
-    const results = (rows.results ?? []).map((row: any) => ({
-      date: row.date,
-      kg: row.kg,
-      lb: Number((row.kg * 2.20462).toFixed(2)),
-    }));
+      const results = (rows.results ?? []).map((row: any) => ({
+        date: row.date,
+        kg: row.kg,
+        lb: Number((row.kg * 2.20462).toFixed(2)),
+      }));
 
-    return c.json(results as z.infer<typeof WeightRow>[]);
+      return c.json(results as z.infer<typeof WeightRow>[]);
+    } catch (error) {
+      console.error("GET error:", error);
+      // Always return an empty array on error to match the declared response type
+      return c.json([] as z.infer<typeof WeightRow>[]);
+    }
   }
 );
 
