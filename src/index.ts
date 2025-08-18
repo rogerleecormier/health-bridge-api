@@ -189,7 +189,7 @@ api.openapi(
   async (c) => {
     try {
       const url = new URL(c.req.url);
-      const limit = Math.max(1, Math.min(200, Number(url.searchParams.get("limit") ?? "30")));
+      const limit = Math.max(1, Math.min(500, Number(url.searchParams.get("limit") ?? "30")));
 
       const rows = await c.env.DB.prepare(
         `SELECT startDate AS date, kg FROM weight ORDER BY startDate DESC LIMIT ?1`
