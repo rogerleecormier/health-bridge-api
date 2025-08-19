@@ -114,11 +114,12 @@ api.openapi(
       const kg = body.unit === "lb" ? body.weight / 2.20462 : body.weight;
       const kgFixed = Number(kg.toFixed(2));
 
-      // Helper to normalize date string to UTC ISO format
+      // Helper to normalize date string to UTC ISO format (no milliseconds, always Z)
       function toUtcIso(dateStr: string): string {
         const d = new Date(dateStr);
         if (isNaN(d.getTime())) throw new Error("Invalid date: " + dateStr);
-        return d.toISOString().replace(/\.\d{3}Z$/, "Z"); // remove milliseconds
+        // Format: YYYY-MM-DDTHH:mm:ssZ
+        return d.toISOString().replace(/\.\d{3}Z$/, "Z");
       }
 
       // Generate UUID if not provided - ensure it's never undefined or empty
