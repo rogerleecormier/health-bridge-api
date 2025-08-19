@@ -114,6 +114,13 @@ api.openapi(
       const kg = body.unit === "lb" ? body.weight / 2.20462 : body.weight;
       const kgFixed = Number(kg.toFixed(2));
 
+      // Helper to normalize date string to UTC ISO format
+      function toUtcIso(dateStr: string): string {
+        const d = new Date(dateStr);
+        if (isNaN(d.getTime())) throw new Error("Invalid date: " + dateStr);
+        return d.toISOString().replace(/\.\d{3}Z$/, "Z"); // remove milliseconds
+      }
+
       // Generate UUID if not provided - ensure it's never undefined or empty
       let uuid = body.uuid?.trim();
       if (!uuid) {
@@ -125,8 +132,14 @@ api.openapi(
       }
       
       // Use timestamp for startDate/endDate if not provided - ensure they're never undefined
-      const startDate = body.startDate?.trim() || body.timestamp;
-      const endDate = body.endDate?.trim() || body.timestamp;
+      let startDate: string, endDate: string;
+      try {
+        startDate = toUtcIso(body.startDate?.trim() || body.timestamp);
+        endDate = toUtcIso(body.endDate?.trim() || body.timestamp);
+      } catch (err) {
+        console.error("Date normalization error:", err);
+        return c.json({ ok: false, error: "Invalid date format" }, 400);
+      }
       const sourceBundleId = body.sourceBundleId?.trim() || "manual-entry";
 
       // Final validation - ensure no undefined or empty values
